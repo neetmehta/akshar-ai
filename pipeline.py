@@ -1,14 +1,16 @@
 """
-AksharAI Document Extraction Pipeline (with Hugging Face Hub Sync)
+AksharAI Document Extraction Pipeline (CLI & Config Driven)
 
 This module orchestrates the end-to-end process of converting scanned documents (PDFs)
-into structured, machine-readable text. It exports the results as a Hugging Face Dataset
-and safely concatenates the new data with existing data on the HF Hub.
+into structured text. It reads settings from a JSON config file, securely loads the 
+Hugging Face token from environment variables, and pushes the generated dataset to the Hub.
 """
 
 import os
 import cv2
+import json
 import logging
+import argparse
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -137,75 +139,102 @@ class DocumentPipeline:
         return dataset
 
     def push_and_concatenate_to_hub(self, new_dataset: Dataset, repo_id: str, hf_token: Optional[str] = None):
-        """
-        Pushes a new dataset to the Hugging Face Hub. If a dataset already exists at
-        the given repo_id, it downloads it, concatenates the new data, and pushes the updated version.
-        
-        Args:
-            new_dataset (Dataset): The newly generated Hugging Face Dataset.
-            repo_id (str): The target repository on HF Hub (e.g., 'neetmehta/akshar-ai-corpus').
-            hf_token (str, optional): Your HF write token. If None, it assumes you are logged in via CLI.
-        """
+        """Pushes and optionally concatenates a dataset to the Hugging Face Hub."""
         logger.info(f"Preparing to upload dataset to Hugging Face Hub at: {repo_id}")
         
         try:
-            # Attempt to load the existing dataset from the Hub (defaulting to the 'train' split)
             logger.info("Checking for existing dataset on the Hub...")
             existing_dataset = load_dataset(repo_id, split="train", token=hf_token)
-            
             logger.info(f"Found existing dataset with {len(existing_dataset)} rows. Merging with new data...")
-            
-            # Ensure the schemas match before concatenating.
-            # cast_column can be used here if schemas mismatch slightly, but for this pipeline they are identical.
             final_dataset = concatenate_datasets([existing_dataset, new_dataset])
             
-        except (RepositoryNotFoundError, ValueError, FileNotFoundError) as e:
-            # If the repo doesn't exist, is empty, or there's no data to load, we push as a fresh dataset.
+        except (RepositoryNotFoundError, ValueError, FileNotFoundError):
             logger.info("No existing dataset found (or repository is empty). Initializing as a new dataset.")
             final_dataset = new_dataset
             
         except Exception as e:
-            # Catch unexpected errors (e.g., network timeout)
             logger.error(f"Failed to load existing dataset due to an unexpected error: {e}")
             raise
 
-        # Push the combined (or new) dataset back to the Hub
         logger.info(f"Pushing dataset with {len(final_dataset)} total rows to the Hub...")
         final_dataset.push_to_hub(repo_id, token=hf_token)
         logger.info("Successfully pushed dataset to the Hugging Face Hub!")
 
 
 if __name__ == "__main__":
-    # --- Configuration ---
-    PDF_FILE = r"F:\projects\akshar-ai\data\botanycompleteco00indr_bw-521.pdf"
-    HF_REPO_ID = "neetmehta/akshar-ai-gujarati-corpus" # Replace with your target repo
-    HF_TOKEN = None # Or insert your specific "hf_..." token string here
-    
-    pipeline = DocumentPipeline(languages=['guj'], max_ocr_workers=4)
+    # Set up argparse for CLI execution
+    parser = argparse.ArgumentParser(description="Run the AksharAI Document Pipeline using a JSON config file.")
+    parser.add_argument(
+        "--config", 
+        type=str, 
+        required=True, 
+        help="Path to the JSON configuration file (e.g., config.json)"
+    )
+    args = parser.parse_args()
+
+    # Read the JSON config file
+    if not os.path.exists(args.config):
+        logger.error(f"Configuration file not found: {args.config}")
+        exit(1)
+        
+    try:
+        with open(args.config, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON config file: {e}")
+        exit(1)
+
+    # Extract configuration variables (with safe defaults)
+    PDF_FILE = config.get("pdf_path")
+    OUTPUT_DIR = config.get("output_image_dir", "temp_images")
+    DPI = config.get("dpi", 300)
+    LANGUAGES = config.get("languages", ["guj", "eng"])
+    MAX_WORKERS = config.get("max_ocr_workers", 4)
+    HF_REPO_ID = config.get("hf_repo_id")
+
+    # Retrieve HF Token securely from Environment Variables
+    # If not found, it will default to None (which falls back to locally cached CLI credentials if available)
+    HF_TOKEN = os.getenv("HF_TOKEN")
+    if not HF_TOKEN:
+        logger.warning("HF_TOKEN environment variable not found. Hugging Face upload may fail if you are not logged in via CLI.")
+
+    # Validate essential config parameters
+    if not PDF_FILE:
+        logger.error("Configuration file MUST include a valid 'pdf_path'.")
+        exit(1)
+
+    # Initialize the pipeline
+    pipeline = DocumentPipeline(languages=LANGUAGES, max_ocr_workers=MAX_WORKERS)
     
     try:
         # 1. Run the extraction pipeline
         extracted_document = pipeline.process_pdf(
             pdf_path=PDF_FILE, 
-            output_image_dir="processed_pages", 
-            dpi=300
+            output_image_dir=OUTPUT_DIR, 
+            dpi=DPI
         )
         
         # 2. Convert to Hugging Face Dataset
         hf_dataset = pipeline.export_to_hf_dataset(
             document_results=extracted_document, 
-            source_name=PDF_FILE
+            source_name=os.path.basename(PDF_FILE)
         )
         
-        # 3. Concatenate (if applicable) and Push to Hub
+        # 3. Concatenate and Push to Hub
         if len(hf_dataset) > 0:
-            pipeline.push_and_concatenate_to_hub(
-                new_dataset=hf_dataset, 
-                repo_id=HF_REPO_ID, 
-                hf_token=HF_TOKEN
-            )
+            if HF_REPO_ID:
+                pipeline.push_and_concatenate_to_hub(
+                    new_dataset=hf_dataset, 
+                    repo_id=HF_REPO_ID, 
+                    hf_token=HF_TOKEN
+                )
+            else:
+                logger.warning("No 'hf_repo_id' specified in config. Saving dataset locally instead.")
+                hf_dataset.save_to_disk(f"{OUTPUT_DIR}_dataset")
         else:
             logger.warning("No text extracted. Aborting Hub upload.")
                 
-    except FileNotFoundError:
-        print(f"Please place a valid PDF named '{PDF_FILE}' in the directory to test the pipeline.")
+    except FileNotFoundError as e:
+        logger.error(e)
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during execution: {e}")
