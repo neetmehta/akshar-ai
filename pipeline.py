@@ -1,9 +1,9 @@
 """
-AksharAI Document Extraction Pipeline (CLI & Config Driven)
+AksharAI Document Extraction Pipeline (CLI, Config & Directory Driven)
 
-This module orchestrates the end-to-end process of converting scanned documents (PDFs)
-into structured text. It reads settings from a JSON config file, securely loads the 
-Hugging Face token from environment variables, and pushes the generated dataset to the Hub.
+This module processes an entire folder of mixed documents (PDFs, JPGs, PNGs).
+It reads settings from a JSON config file, securely loads the Hugging Face token 
+from environment variables, and pushes the generated dataset to the Hub.
 """
 
 import os
@@ -11,6 +11,7 @@ import cv2
 import json
 import logging
 import argparse
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -34,8 +35,12 @@ logger = logging.getLogger(__name__)
 
 class DocumentPipeline:
     """
-    A scalable pipeline to extract text from PDFs and sync to Hugging Face Datasets.
+    A scalable pipeline to extract text from a directory of mixed document formats
+    and sync them to Hugging Face Datasets.
     """
+    
+    SUPPORTED_IMAGE_EXTS = {'.png', '.jpg', '.jpeg'}
+    SUPPORTED_PDF_EXTS = {'.pdf'}
 
     def __init__(self, languages: List[str] = ['guj', 'eng'], max_ocr_workers: int = 4):
         logger.info("Initializing DocumentPipeline...")
@@ -46,45 +51,69 @@ class DocumentPipeline:
         self.cropper = ParagraphCropper()
         logger.info("Pipeline initialized successfully.")
 
-    def process_pdf(self, pdf_path: str, output_image_dir: str = "temp_images", dpi: int = 300) -> List[Dict[str, Any]]:
-        """Executes the full extraction pipeline on a given PDF."""
-        if not os.path.exists(pdf_path):
-            raise FileNotFoundError(f"Source PDF not found: {pdf_path}")
+    def process_directory(self, input_dir: str, output_image_dir: str = "temp_images", dpi: int = 300) -> List[Dict[str, Any]]:
+        """Scans a directory for supported files (PDFs and Images) and processes all of them."""
+        input_path = Path(input_dir)
+        if not input_path.is_dir():
+            raise NotADirectoryError(f"Directory not found: {input_dir}")
 
-        logger.info(f"Starting pipeline for PDF: {pdf_path}")
+        logger.info(f"Scanning directory: {input_dir}")
+        all_results = []
+
+        for file_path in input_path.rglob("*"):
+            if file_path.is_file():
+                ext = file_path.suffix.lower()
+                if ext in self.SUPPORTED_PDF_EXTS or ext in self.SUPPORTED_IMAGE_EXTS:
+                    file_results = self.process_file(str(file_path), output_image_dir, dpi)
+                    all_results.extend(file_results)
+
+        logger.info(f"Finished processing directory. Extracted data from {len(all_results)} total pages/images.")
+        return all_results
+
+    def process_file(self, file_path: str, output_image_dir: str = "temp_images", dpi: int = 300) -> List[Dict[str, Any]]:
+        """Routes a single file to the appropriate extraction logic based on its extension."""
+        path_obj = Path(file_path)
+        ext = path_obj.suffix.lower()
+        file_name = path_obj.name
+        
+        logger.info(f"--- Starting pipeline for file: {file_name} ---")
         document_results = []
 
         try:
-            # Step 1: Convert PDF to High-Res Images
-            page_image_paths = split_pdf_to_images(pdf_path, output_dir=output_image_dir, dpi=dpi)
-            
-            # Step 2 & 3: Layout Parsing and OCR
-            for page_num, image_path in enumerate(page_image_paths):
-                logger.info(f"Processing Page {page_num + 1}/{len(page_image_paths)}...")
-                page_data = self._process_single_page(image_path, page_num)
-                document_results.append(page_data)
+            if ext in self.SUPPORTED_PDF_EXTS:
+                page_image_paths = split_pdf_to_images(file_path, output_dir=output_image_dir, dpi=dpi)
                 
-            logger.info("Extraction execution completed.")
+                for page_num, image_path in enumerate(page_image_paths):
+                    logger.info(f"Processing {file_name} - Page {page_num + 1}/{len(page_image_paths)}...")
+                    page_data = self._process_single_page(image_path, page_num + 1, source_name=file_name)
+                    document_results.append(page_data)
+                    
+            elif ext in self.SUPPORTED_IMAGE_EXTS:
+                logger.info(f"Processing image file {file_name} directly...")
+                page_data = self._process_single_page(file_path, page_num=1, source_name=file_name)
+                document_results.append(page_data)
+
             return document_results
 
         except Exception as e:
-            logger.error(f"Pipeline failed during execution: {e}")
-            raise
+            logger.error(f"Pipeline failed during execution of {file_name}: {e}")
+            return document_results
 
-    def _process_single_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
+    def _process_single_page(self, image_path: str, page_num: int, source_name: str) -> Dict[str, Any]:
         """Processes a single image page for paragraphs and OCR."""
         image = cv2.imread(image_path)
         if image is None:
             logger.warning(f"Failed to read image at {image_path}. Skipping page.")
-            return {"page": page_num + 1, "paragraphs": []}
+            return {"source": source_name, "page": page_num, "paragraphs": []}
 
         crops = self.cropper.crop_paragraphs(image, threshold=0.85)
-        logger.info(f"Page {page_num + 1}: Detected {len(crops)} paragraphs.")
+        logger.info(f"{source_name} [Page {page_num}]: Detected {len(crops)} paragraphs.")
 
         extracted_texts = self._parallel_ocr(crops)
 
         return {
-            "page": page_num + 1,
+            "source": source_name,
+            "page": page_num,
             "paragraphs": extracted_texts
         }
 
@@ -112,8 +141,8 @@ class DocumentPipeline:
 
         return [text for text in results if text is not None]
 
-    def export_to_hf_dataset(self, document_results: List[Dict[str, Any]], source_name: str = "unknown_pdf") -> Dataset:
-        """Converts extracted text into a Hugging Face Dataset."""
+    def export_to_hf_dataset(self, document_results: List[Dict[str, Any]]) -> Dataset:
+        """Converts extracted text across multiple documents into a Hugging Face Dataset."""
         logger.info("Converting extracted data to Hugging Face Dataset format...")
         
         hf_data_dict = {
@@ -124,7 +153,9 @@ class DocumentPipeline:
         }
         
         for page_data in document_results:
+            source_name = page_data["source"]
             page_num = page_data["page"]
+            
             for p_idx, para_text in enumerate(page_data["paragraphs"]):
                 if not para_text.strip():
                     continue
@@ -185,7 +216,7 @@ if __name__ == "__main__":
         exit(1)
 
     # Extract configuration variables (with safe defaults)
-    PDF_FILE = config.get("pdf_path")
+    INPUT_DIR = config.get("input_directory")
     OUTPUT_DIR = config.get("output_image_dir", "temp_images")
     DPI = config.get("dpi", 300)
     LANGUAGES = config.get("languages", ["guj", "eng"])
@@ -193,31 +224,29 @@ if __name__ == "__main__":
     HF_REPO_ID = config.get("hf_repo_id")
 
     # Retrieve HF Token securely from Environment Variables
-    # If not found, it will default to None (which falls back to locally cached CLI credentials if available)
     HF_TOKEN = os.getenv("HF_TOKEN")
     if not HF_TOKEN:
         logger.warning("HF_TOKEN environment variable not found. Hugging Face upload may fail if you are not logged in via CLI.")
 
     # Validate essential config parameters
-    if not PDF_FILE:
-        logger.error("Configuration file MUST include a valid 'pdf_path'.")
+    if not INPUT_DIR:
+        logger.error("Configuration file MUST include a valid 'input_directory'.")
         exit(1)
 
     # Initialize the pipeline
     pipeline = DocumentPipeline(languages=LANGUAGES, max_ocr_workers=MAX_WORKERS)
     
     try:
-        # 1. Run the extraction pipeline
-        extracted_document = pipeline.process_pdf(
-            pdf_path=PDF_FILE, 
+        # 1. Run the extraction pipeline on the entire directory
+        extracted_data = pipeline.process_directory(
+            input_dir=INPUT_DIR, 
             output_image_dir=OUTPUT_DIR, 
             dpi=DPI
         )
         
         # 2. Convert to Hugging Face Dataset
         hf_dataset = pipeline.export_to_hf_dataset(
-            document_results=extracted_document, 
-            source_name=os.path.basename(PDF_FILE)
+            document_results=extracted_data
         )
         
         # 3. Concatenate and Push to Hub
@@ -234,7 +263,7 @@ if __name__ == "__main__":
         else:
             logger.warning("No text extracted. Aborting Hub upload.")
                 
-    except FileNotFoundError as e:
+    except NotADirectoryError as e:
         logger.error(e)
     except Exception as e:
         logger.error(f"An unexpected error occurred during execution: {e}")

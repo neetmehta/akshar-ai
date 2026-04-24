@@ -1,8 +1,9 @@
 {
-  "pdf_path": "F:\\projects\\akshar-ai\\data\\botanycompleteco00indr_bw-521.pdf",
-  "output_image_dir": "processed_pages",
+  "input_directory": "epaper_downloads/2024-01-01",
+  "output_image_dir": "temp_images",
   "dpi": 300,
   "languages": ["guj", "eng"],
   "max_ocr_workers": 4,
   "hf_repo_id": "neetmehta/akshar-ai-gujarati-corpus"
 }
+
